@@ -1,0 +1,287 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Fork-friendly Windows portable build for LichtFeld Studio.
+# Derived from upstream .github/workflows/nightly.yml ("Windows Package Publish").
+#
+# Put this file in YOUR fork at:  .github/workflows/build-windows-portable.yml
+# Then run it from: Actions > "Build Windows portable zip (fork)" > Run workflow
+#
+# Changes relative to upstream nightly.yml:
+#   - Dropped the "precheck" job (queries upstream's own workflow run history)
+#     and the reusable "windows-preflight" job (upstream-only source contracts).
+#   - Dropped every github.repository == 'MrNeRF/LichtFeld-Studio' guard, so the
+#     job actually runs in a fork.
+#   - Dropped the "Run configured MSVC preflight" step (it consumed precheck's
+#     previous_sha output). The separate shader-header target is kept because the
+#     full build expects it.
+#   - Package naming no longer reads .github/nightly-target-version.txt, which is
+#     a placeholder in a fresh fork and would abort the build.
+#   - Replaced "Verify AWS CLI" / "Upload package to Cloudflare R2" /
+#     "Verify R2 upload" with actions/upload-artifact, so the zip is
+#     downloadable from the run page instead of going to a private bucket.
+#   - Added a SHA-256 sidecar, a build summary with a direct artifact URL, an
+#     explicit timeout, and concurrency control.
+#
+# Everything that actually builds the app is upstream's own recipe, kept
+# verbatim: CUDA 12.8 install, vcpkg setup and caches, configure with
+# -DBUILD_PORTABLE=ON, Ninja build, and cmake --install into dist/.
+#
+# Legal note: the source is GPLv3-or-later. Building it for yourself is free.
+# If you redistribute the zip, keep the LICENSE files that cmake --install puts
+# in dist/ and make the exact source (the commit SHA below) available too.
+# NVIDIA runtime libraries are covered by upstream LICENSE-EXCEPTION.txt.
+
+name: Build Windows portable zip (fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: Days to keep the downloadable artifact
+        required: false
+        type: choice
+        default: '7'
+        options:
+          - '1'
+          - '3'
+          - '7'
+          - '14'
+          - '30'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
+      VCPKG_BUILD_TYPE: release
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+      BUILD_DIR: b
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install CUDA 12.8
+        run: |
+          cd ..
+          Invoke-WebRequest https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe -OutFile cuda.exe -Verbose
+          Start-Process -FilePath .\cuda.exe -ArgumentList "-y -s -accepteula -toolkit -override -noDisplayDriver" -Wait
+
+      - name: Set CUDA environment
+        run: |
+          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Normalize vcpkg path
+        run: '"VCPKG_ROOT=$([System.IO.Path]::GetFullPath($env:VCPKG_ROOT))" >> $env:GITHUB_ENV'
+
+      - name: Cache vcpkg tool
+        id: cache-vcpkg-tool
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          # Forks do not inherit upstream's Actions cache. The first run will
+          # clone vcpkg and compile every dependency from scratch, which is why
+          # it takes 1.5-3 hours. Later runs reuse this cache.
+          key: vcpkg-tool-${{ runner.os }}-2026-10-22
+
+      - name: Setup vcpkg
+        if: steps.cache-vcpkg-tool.outputs.cache-hit != 'true'
+        run: |
+          cd ..
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Cache vcpkg_installed
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-prebuilt-ort-v1-
+
+      # Upstream's configure step, unchanged. BUILD_PORTABLE=ON is what makes
+      # dist/ self-contained (bundled CUDA/runtime DLLs, ~518 MB before zip).
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildDir = $env:BUILD_DIR
+          $cmakeArgs = "-B $buildDir -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF"
+          $retryablePatterns = @(
+            'status code 5\d\d',
+            'timed out',
+            'timeout',
+            'connection reset',
+            'failed to connect',
+            'temporarily unavailable',
+            'tls',
+            'ssl'
+          )
+
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Configure attempt $attempt/3"
+            cmd /c "call `"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat`" && cmake $cmakeArgs"
+
+            if ($LASTEXITCODE -eq 0) {
+              exit 0
+            }
+
+            $shouldRetry = $false
+            $manifestLog = Join-Path $buildDir 'vcpkg-manifest-install.log'
+            if (Test-Path $manifestLog) {
+              foreach ($pattern in $retryablePatterns) {
+                if (Select-String -Path $manifestLog -Pattern $pattern -Quiet) {
+                  $shouldRetry = $true
+                  break
+                }
+              }
+            }
+
+            if (-not $shouldRetry -or $attempt -eq 3) {
+              exit $LASTEXITCODE
+            }
+
+            Write-Warning "Retryable configure failure detected, cleaning build tree before retry."
+            if (Test-Path $buildDir) {
+              Remove-Item -Recurse -Force $buildDir
+            }
+            Start-Sleep -Seconds (15 * $attempt)
+          }
+
+      - name: Generate shader headers
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set PATH=%CD%\%BUILD_DIR%\vcpkg_installed\x64-windows\bin;%PATH%
+          cmake --build %BUILD_DIR% --target lfs_shader_headers --config Release -j 4
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build %BUILD_DIR% -j %NUMBER_OF_PROCESSORS%
+
+      - name: Dump failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $buildDir = $env:BUILD_DIR
+          $paths = @(
+            "$buildDir\vcpkg-manifest-install.log",
+            "$buildDir\vcpkg_installed\vcpkg\issue_body.md",
+            "$buildDir\CMakeFiles\CMakeConfigureLog.yaml",
+            "$buildDir\CMakeFiles\CMakeError.log",
+            "$buildDir\CMakeFiles\CMakeOutput.log",
+            "$buildDir\CMakeCache.txt"
+          )
+
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Write-Host "::group::$path"
+              Get-Content $path -Tail 400
+              Write-Host "::endgroup::"
+            }
+          }
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-diagnostics-${{ github.run_number }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ env.BUILD_DIR }}/CMakeCache.txt
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeError.log
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeOutput.log
+            ${{ env.BUILD_DIR }}/vcpkg-manifest-install.log
+            ${{ env.BUILD_DIR }}/vcpkg_installed/vcpkg/issue_body.md
+            ${{ env.BUILD_DIR }}/vcpkg_installed/vcpkg/blds/**/*.log
+
+      - name: Package portable build
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dateStamp = Get-Date -AsUTC -Format "yyyyMMdd"
+          $shortSha  = (git rev-parse --short HEAD).Trim()
+          $fullSha   = (git rev-parse HEAD).Trim()
+          $builtAt   = Get-Date -AsUTC -Format "yyyy-MM-ddTHH:mm:ssZ"
+          $version   = "dev$dateStamp-$shortSha"
+          $zipName   = "LichtFeld-Studio-windows-portable-$version.zip"
+
+          cmake --install $env:BUILD_DIR --prefix dist
+
+          if (-not (Test-Path "dist\bin")) {
+            throw "Portable install did not produce dist\bin"
+          }
+          $exe = @(Get-ChildItem -Path "dist\bin" -Filter "*.exe" -File -ErrorAction SilentlyContinue)
+          if ($exe.Count -eq 0) {
+            throw "No executable found in dist\bin"
+          }
+
+          Compress-Archive -Path dist\* -DestinationPath $zipName
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zipName).Hash.ToLowerInvariant()
+          Set-Content -Path "$zipName.sha256" -Value "$hash  $zipName" -Encoding ascii
+          $sizeMB = [math]::Round((Get-Item $zipName).Length / 1MB)
+
+          "zip_name=$zipName"   >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+          "full_sha=$fullSha"   >> $env:GITHUB_OUTPUT
+          "built_at=$builtAt"   >> $env:GITHUB_OUTPUT
+          "sha256=$hash"        >> $env:GITHUB_OUTPUT
+          "size_mb=$sizeMB"     >> $env:GITHUB_OUTPUT
+
+      # This is the fork's replacement for upstream's private R2 upload.
+      # compression-level 0 skips re-zipping an already compressed archive.
+      - name: Upload portable zip
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: LichtFeld-Studio-windows-${{ steps.package.outputs.short_sha }}
+          path: |
+            ${{ steps.package.outputs.zip_name }}
+            ${{ steps.package.outputs.zip_name }}.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days || '7' }}
+          compression-level: 0
+          overwrite: true
+
+      - name: Build summary
+        shell: pwsh
+        env:
+          ZIP_NAME: ${{ steps.package.outputs.zip_name }}
+          FULL_SHA: ${{ steps.package.outputs.full_sha }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+          SIZE_MB: ${{ steps.package.outputs.size_mb }}
+          BUILT_AT: ${{ steps.package.outputs.built_at }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          @(
+            '## Portable Windows build ready',
+            '',
+            "- Package: $env:ZIP_NAME",
+            "- Size: $env:SIZE_MB MB",
+            "- Commit: $env:FULL_SHA",
+            "- Built at: $env:BUILT_AT",
+            "- SHA-256: $env:SHA256",
+            "- Download (Artifacts section): $env:RUN_URL",
+            '',
+            'Unzip into an empty folder, then run bin/LichtFeld-Studio.exe.',
+            'Requires an NVIDIA RTX 20-series or newer GPU and driver 570+.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
